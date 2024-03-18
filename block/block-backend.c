@@ -1866,6 +1866,33 @@ BlockAcctStats *blk_get_stats(BlockBackend *blk)
     return &blk->stats;
 }
 
+int cdp_push_write_req(BlockBackend* blk, int64_t sector_num, QEMUIOVector *qiov)
+{
+    BlockDriverState *file_bs = NULL;
+    BlockDriver *file_drv = NULL;
+
+    if( blk && 
+        blk->root && 
+        blk->root->bs && 
+        blk->root->bs->file ) {
+
+        file_bs = blk->root->bs->file->bs;
+        file_drv = file_bs->drv;
+    }
+
+    if( ! file_drv || 
+        strcmp(file_drv->protocol_name, "file") ) {
+        return 0;
+    }
+    
+    if( file_drv->bdrv_co_cdp_push_write ) {
+
+        file_drv->bdrv_co_cdp_push_write(file_bs, sector_num, qiov);
+    }
+
+    return 0;
+}
+
 void *blk_aio_get(const AIOCBInfo *aiocb_info, BlockBackend *blk,
                   BlockCompletionFunc *cb, void *opaque)
 {

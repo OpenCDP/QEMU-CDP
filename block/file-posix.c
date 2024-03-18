@@ -136,6 +136,19 @@ do { \
 #define RAW_LOCK_PERM_BASE             100
 #define RAW_LOCK_SHARED_BASE           200
 
+//cdp define
+#define FILE_PATH		    "/dev/shm"      //bio数据、元数据存放目录
+#define META_FILE_NAME      "metafile"      //元数据文件命名
+#define DATA_FILE_NAME      "datafile"      //bio数据文件命名
+#define MAX_DATA_FILE_SIZE  (1024*1024*10)  //单个bio数据文件最大容量50MB
+#define META_BUFFER_SIZE	(200)           //元数据写入文件的缓冲区公用大小
+
+typedef struct CDPWriteReq {
+    int64_t sector_num;
+    QEMUIOVector *qiov;
+    QTAILQ_ENTRY(CDPWriteReq) reqs;
+} CDPWriteReq;
+
 typedef struct BDRVRawState {
     int fd;
     int lock_fd;
@@ -158,6 +171,17 @@ typedef struct BDRVRawState {
     bool page_cache_inconsistent:1;
     bool has_fallocate;
     bool needs_alignment;
+
+    //
+    pthread_t cdp_thread_id;
+    bool is_cdp_work_exit;
+    QemuMutex cdp_lock;
+    QTAILQ_HEAD(, CDPWriteReq) cdp_write_wait_req_list;
+    QTAILQ_HEAD(, CDPWriteReq) cdp_write_req_list;
+    //
+    struct file *meta_file;
+    struct file *data_file;
+    char meta_buffer[META_BUFFER_SIZE];
 
     PRManager *pr_mgr;
 } BDRVRawState;
@@ -187,6 +211,10 @@ typedef struct RawPosixAIOData {
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
 static int cdrom_reopen(BlockDriverState *bs);
 #endif
+
+static int open_meta_file(BDRVRawState *s);
+static int open_data_file(BDRVRawState *s);
+static void cdp_work_thread(void *data);
 
 #if defined(__NetBSD__)
 static int raw_normalize_devicepath(const char **filename)
@@ -595,6 +623,23 @@ static int raw_open_common(BlockDriverState *bs, QDict *options,
         s->is_xfs = true;
     }
 #endif
+
+
+    //cdp
+    if( open_meta_file(s) ) {
+        goto skip_cdp;    
+    }
+    if( open_data_file(s) ) {
+        goto skip_cdp;
+    }
+
+    qemu_mutex_init(&s->cdp_lock);
+    s->is_cdp_work_exit = false;
+    QTAILQ_INIT(&s->cdp_write_wait_req_list);
+    QTAILQ_INIT(&s->cdp_write_req_list);
+    pthread_create(&s->cdp_thread_id, NULL, &cdp_work_thread, bs); 
+
+skip_cdp:    
 
     ret = 0;
 fail:
@@ -1602,6 +1647,255 @@ static int coroutine_fn raw_co_pwritev(BlockDriverState *bs, uint64_t offset,
     return raw_co_prw(bs, offset, bytes, qiov, QEMU_AIO_WRITE);
 }
 
+static CDPWriteReq* new_cdp_write_req(int64_t sector_num, QEMUIOVector *qiov)
+{
+    if( qiov->size <= 0 ) {
+        return NULL;
+    }
+    CDPWriteReq *req = g_malloc(sizeof(CDPWriteReq));
+    if( ! req ) {
+        return NULL;
+    }
+    req->sector_num = sector_num;
+    req->qiov = g_new0(struct QEMUIOVector, qiov->niov);
+    req->qiov->niov = qiov->niov;
+    req->qiov->size = qiov->size;
+    req->qiov->iov = g_new0(struct iovec, qiov->niov);
+    for( int i = 0; i < qiov->niov; i++ ) {
+        req->qiov->iov[i].iov_base = g_malloc(qiov->iov[i].iov_len);
+        req->qiov->iov[i].iov_len = qiov->iov[i].iov_len;
+        memcpy(req->qiov->iov[i].iov_base, qiov->iov[i].iov_base, qiov->iov[i].iov_len);
+    }
+    return req;
+}
+
+static void free_cdp_write_req(CDPWriteReq *req)
+{
+    //free qiov...
+    for( int i = 0; i < req->qiov->niov; i++ ) {
+        g_free(req->qiov->iov[i].iov_base);
+    }
+    g_free(req->qiov->iov);
+    g_free(req->qiov);
+    g_free(req);
+}
+
+/* 生成当前时间戳 */
+static int gen_current_time_str(char *buff)
+{
+    time_t curr_time;
+    struct tm *local_time;
+
+    curr_time = time(NULL);
+    local_time = localtime(&curr_time);
+
+    //printf("当前日期：%d年 %d月 %d日\n", (1900 + localTime->tm_year), (1 + localTime->tm_mon), localTime->tm_mday);
+    //printf("当前时间：%d:%d:%d\n", localTime->tm_hour, localTime->tm_min, localTime->tm_sec);
+
+    return sprintf(buff, "%u-%02u-%02u-%02u-%02u-%02u",
+		local_time->tm_year + 1900, local_time->tm_mon + 1, local_time->tm_mday,
+		local_time->tm_hour, local_time->tm_min, local_time->tm_sec);
+
+    return 0;
+}
+
+/* 关闭元数据文件 */
+static int close_meta_file(BDRVRawState *s)
+{
+    if( s->meta_file ) {
+        fclose(s->meta_file);
+        s->meta_file = NULL;
+    }
+    return 0;
+}
+
+static int open_meta_file(BDRVRawState *s)
+{
+    int ret;
+    char time_str[100];
+    char filename[100];
+
+    close_meta_file(s);
+
+    gen_current_time_str(time_str);
+    sprintf(filename, "%s/%s.%s", FILE_PATH, META_FILE_NAME, time_str);
+    s->meta_file = fopen(filename, "wb");
+    if( ! s->meta_file ) {
+        fprintf(stderr, "open_meta_file %s NULL", filename);
+        return 1;
+    }
+    fprintf(stdout, "open_meta_file %s", filename);
+    return 0;
+}
+
+/* 关闭bio数据文件 */
+static int close_data_file(BDRVRawState *s)
+{
+    if( s->data_file ) {
+        fclose(s->data_file);
+        s->data_file = NULL;
+    }
+    return 0;
+}
+
+/* 打开bio数据文件，文件命名格式：datafile.时间戳 */
+static int open_data_file(BDRVRawState *s)
+{
+    int ret;
+    char time_str[100];
+    char filename[100];
+
+    close_data_file(s);
+
+    gen_current_time_str(time_str);
+    sprintf(filename, "%s/%s.%s", FILE_PATH, DATA_FILE_NAME, time_str);
+    s->data_file = fopen(filename, "wb");
+    if( ! s->data_file ) {
+        fprintf(stderr, "open_data_file %sNULL", filename);
+        return 1;
+    }
+    fprintf(stdout, "open_data_file %s", filename);
+    return 0;
+}
+
+/* 生成一个元数据字符串， 年-月-日-时-分-秒:[写入host扇区号][写入数据长度][写入数据在bio数据文件偏移] */
+static int gen_meta_log_2(unsigned int start_sector, unsigned int length,
+                          unsigned int data_file_pos, unsigned char *buff)
+{
+    char time_str[100];
+    int ret;
+
+    gen_current_time_str(time_str);
+    ret = sprintf(buff, "%s:[%u][%u][%u]\n", time_str, start_sector, length, data_file_pos);
+    return ret;
+}
+
+/* 写入一条元数据记录 */
+static int write_meta_log_2(BDRVRawState *s, unsigned int start_sector, 
+                            unsigned int length, int data_file_pos)
+{
+    int ret;
+
+    if( ! s->meta_file ) {
+        return -1;
+    }
+
+    ret = gen_meta_log_2(start_sector, length, data_file_pos, s->meta_buffer);
+    //printk(KERN_INFO "kernel_write_2 %s", meta_buffer);
+
+    ret = fwrite(s->meta_buffer, sizeof(unsigned char), ret, s->meta_file);
+    //printk(KERN_INFO "kernel_write_2_ret %d\n", ret);
+    if( ret > 0 ) {
+        fflush(s->meta_file);
+    }
+    return ret;
+}
+
+/* 检查bio数据文件是否需超过大小，重新再生成一个新的 */
+static int check_log_file(BDRVRawState *s, unsigned int data_size)
+{
+    if( ftell(s->data_file) > MAX_DATA_FILE_SIZE ||
+        ftell(s->meta_file) > MAX_DATA_FILE_SIZE ) {
+        fprintf(stdout, "check_log_file create_new");
+        close_data_file(s);
+        close_meta_file(s);
+        open_meta_file(s);
+        open_data_file(s);
+        return 0;
+    }
+    return ftell(s->data_file);
+}
+
+/* 写入一个bio数据到bio数据文件 */
+static int write_data_file_bio(BDRVRawState *s, CDPWriteReq *req)
+{
+    int ret = 0;
+    for( int i = 0; i < req->qiov->niov; i++ ) {
+        int write_ret = fwrite(req->qiov->iov[i].iov_base, sizeof(char), 
+                               req->qiov->iov[i].iov_len, s->data_file);
+        if( write_ret >= 0 ) {
+            ret += write_ret;
+            fflush(s->data_file);
+        } else {
+            return write_ret;
+        }
+    }
+    return ret;
+}
+
+static int coroutine_fn raw_co_cdp_push_write(BlockDriverState *bs, 
+                                                int64_t sector_num, QEMUIOVector *qiov)
+{
+    BDRVRawState *s = bs->opaque;
+    CDPWriteReq *req;
+
+    if( ! qiov->iov ) {
+        return 0;
+    }
+
+    trace_cdp_co_push_write(sector_num, qiov->iov, qiov->size);
+
+    req = new_cdp_write_req(sector_num, qiov);
+    if( req ) {
+        qemu_mutex_lock(&s->cdp_lock);
+        QTAILQ_INSERT_TAIL(&s->cdp_write_wait_req_list, req, reqs);
+        qemu_mutex_unlock(&s->cdp_lock);
+    }
+    
+    return 0;
+}
+
+static int cdp_wait_to_write_list(BDRVRawState *s)
+{
+    int i = 0;
+    CDPWriteReq *req, *next;
+
+    qemu_mutex_lock(&s->cdp_lock);
+
+    QTAILQ_FOREACH_SAFE(req, &s->cdp_write_wait_req_list, reqs, next) {
+        QTAILQ_REMOVE(&s->cdp_write_wait_req_list, req, reqs);
+        QTAILQ_INSERT_TAIL(&s->cdp_write_req_list, req, reqs);
+        i++;
+    }
+
+    qemu_mutex_unlock(&s->cdp_lock);
+
+    return i;
+}
+
+static void cdp_work_thread(void *data)
+{
+    BlockDriverState *bs = (BlockDriverState*)data;
+    BDRVRawState *s = bs->opaque;
+    CDPWriteReq *req, *next;
+    long data_file_pos;
+    int ret1, ret2;
+
+    while( ! s->is_cdp_work_exit ) {
+
+        int i = cdp_wait_to_write_list(s);
+        trace_cdp_write_wait_reqs_count(i);
+        if( ! i ) {
+            sleep(1);
+            continue;
+        }
+        QTAILQ_FOREACH_SAFE(req, &s->cdp_write_req_list, reqs, next) {
+
+            QTAILQ_REMOVE(&s->cdp_write_req_list, req, reqs);
+
+            data_file_pos = check_log_file(s, req->qiov->size);
+            ret1 = write_meta_log_2(s,req->sector_num, req->qiov->size, data_file_pos);
+            ret2 = write_data_file_bio(s, req);
+            if( ret1 <=0 || ret2 <= 0 ) {
+                fprintf(stderr, "cdp write data error %d %d", ret1, ret2);
+            }
+
+            free_cdp_write_req(req);    
+        }
+    }
+
+}
+
 static void raw_aio_plug(BlockDriverState *bs)
 {
 #ifdef CONFIG_LINUX_AIO
@@ -1638,6 +1932,9 @@ static BlockAIOCB *raw_aio_flush(BlockDriverState *bs,
 static void raw_close(BlockDriverState *bs)
 {
     BDRVRawState *s = bs->opaque;
+
+    s->is_cdp_work_exit = true;
+    pthread_join(s->cdp_thread_id, NULL);
 
     if (s->fd >= 0) {
         qemu_close(s->fd);
@@ -1694,7 +1991,6 @@ static int raw_regular_truncate(int fd, int64_t offset, PreallocMode prealloc,
     case PREALLOC_MODE_FULL:
     {
         int64_t num = 0, left = offset - current_length;
-        off_t seek_result;
 
         /*
          * Knowing the final size from the beginning could allow the file
@@ -1709,8 +2005,8 @@ static int raw_regular_truncate(int fd, int64_t offset, PreallocMode prealloc,
 
         buf = g_malloc0(65536);
 
-        seek_result = lseek(fd, current_length, SEEK_SET);
-        if (seek_result < 0) {
+        result = lseek(fd, current_length, SEEK_SET);
+        if (result < 0) {
             result = -errno;
             error_setg_errno(errp, -result,
                              "Failed to seek to the old end of file");
@@ -2286,6 +2582,9 @@ BlockDriver bdrv_file = {
 
     .bdrv_co_preadv         = raw_co_preadv,
     .bdrv_co_pwritev        = raw_co_pwritev,
+
+    .bdrv_co_cdp_push_write = raw_co_cdp_push_write,
+
     .bdrv_aio_flush = raw_aio_flush,
     .bdrv_aio_pdiscard = raw_aio_pdiscard,
     .bdrv_refresh_limits = raw_refresh_limits,
@@ -2763,6 +3062,7 @@ static BlockDriver bdrv_host_device = {
 
     .bdrv_co_preadv         = raw_co_preadv,
     .bdrv_co_pwritev        = raw_co_pwritev,
+
     .bdrv_aio_flush	= raw_aio_flush,
     .bdrv_aio_pdiscard   = hdev_aio_pdiscard,
     .bdrv_refresh_limits = raw_refresh_limits,

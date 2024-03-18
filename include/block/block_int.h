@@ -190,6 +190,10 @@ struct BlockDriver {
     int coroutine_fn (*bdrv_co_pwritev)(BlockDriverState *bs,
         uint64_t offset, uint64_t bytes, QEMUIOVector *qiov, int flags);
 
+
+    int coroutine_fn (*bdrv_co_cdp_push_write)(BlockDriverState *bs, 
+                                                int64_t sector_num, QEMUIOVector *qiov);
+
     /*
      * Efficiently zero a region of the disk image.  Typically an image format
      * would use a compact metadata representation to implement this.  This
@@ -727,6 +731,7 @@ struct BlockDriverState {
 
     /* Only read/written by whoever has set active_flush_req to true.  */
     unsigned int flushed_gen;             /* Flushed write generation */
+
 };
 
 struct BlockBackendRootState {

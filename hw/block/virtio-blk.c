@@ -29,6 +29,8 @@
 #include "hw/virtio/virtio-bus.h"
 #include "hw/virtio/virtio-access.h"
 
+
+
 static void virtio_blk_init_request(VirtIOBlock *s, VirtQueue *vq,
                                     VirtIOBlockReq *req)
 {
@@ -49,6 +51,13 @@ static void virtio_blk_req_complete(VirtIOBlockReq *req, unsigned char status)
 {
     VirtIOBlock *s = req->dev;
     VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    uint32_t type;
+
+    type = virtio_ldl_p(VIRTIO_DEVICE(req->dev), &req->out.type);
+    bool is_write = type & VIRTIO_BLK_T_OUT;
+    if( is_write && ! status ) {
+        cdp_push_write_req(s->blk, req->sector_num, &req->qiov);
+    }
 
     trace_virtio_blk_req_complete(vdev, req, status);
 
