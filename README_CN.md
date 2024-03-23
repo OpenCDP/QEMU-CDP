@@ -1,8 +1,11 @@
 ## QEMU-CDP 
 
 ```
-#编译qemu代码需要预安装对应的依赖库如glib等，这里不展开
+#编译qemu代码需要预安装对应的依赖库如glib等
 #编译环境 ubuntu 18.06
+apt install glib*
+apt install libglib2.0-dev
+apt install libpixman-1-dev
 
 #目前基于qemu stable-2.11版本修改，因此clone对应版本代码
 git clone -b stable-2.11 https://github.com/OpenCDP/QEMU-CDP.git
@@ -12,6 +15,8 @@ mkdir build
 cd build
 #配置编译参数并编译，启用kvm虚拟化，只编译x86 64版本，启用debug调试信息
 #启用trace event为syslog，这样可以方便观察我们cdp日志，/var/log/syslog
+#不把warring当成error，否则无法编译通过
+export CFLAGS="-Wno-error"
 ../configure --enable-kvm --target-list=x86_64-softmmu --enable-debug --enable-trace-backend=syslog
 make
 #一切顺利后，在build目录将会看到x86_64-softmmu/qemu-system-x86_64，里面存放了编译好的二进制文件

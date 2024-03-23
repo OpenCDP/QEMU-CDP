@@ -1,12 +1,19 @@
 ## QEMU-CDP 
 
 ```
+#ubuntu 18.04 x86_64
+
+apt install glib*
+apt install libglib2.0-dev
+apt install libpixman-1-dev
+
 #clone the code
 git clone -b stable-2.11 https://github.com/OpenCDP/QEMU-CDP.git
 cd QEMU-CDP
 mkdir build
 cd build
 #build qemu
+export CFLAGS="-Wno-error"
 ../configure --enable-kvm --target-list=x86_64-softmmu --enable-debug --enable-trace-backend=syslog
 make
 
