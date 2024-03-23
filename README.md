@@ -8,13 +8,15 @@ mkdir build
 cd build
 #build qemu
 ../configure --enable-kvm --target-list=x86_64-softmmu --enable-debug --enable-trace-backend=syslog
-
-#create vm interface
-tunctl
-ip link set tap0 up
-brctl addif virbr0 tap0
+make
 
 #download cirros image ...
+mkdir /opt/vm
+cd /opt/vm
+wget "http://download.cirros-cloud.net/0.6.1/cirros-0.6.1-x86_64-disk.img"
+#convert qcow2 to raw format
+qemu-img convert -f qcow2 -O raw cirros-0.6.1-x86_64-disk.img cirros-0.6.1-x86_64-disk.raw
+
 #run the qemu
 /opt/QEMU-CDP/build/x86_64-softmmu/qemu-system-x86_64 -m 128 -enable-kvm \
 -drive file=/opt/vm/cirros-0.6.1-x86_64-disk.raw,format=raw,if=virtio,id=drive-virtio-disk0 \
