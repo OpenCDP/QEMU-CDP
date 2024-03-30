@@ -1,5 +1,7 @@
 ## QEMU-CDP 
 
+[QEMU-CDP设计概述](https://github.com/OpenCDP/OpenCDP/blob/main/QEMU-CDP_README_CN.md)
+
 ```
 #编译qemu代码需要预安装对应的依赖库如glib等
 #编译环境 ubuntu 18.06
