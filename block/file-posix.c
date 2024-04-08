@@ -212,8 +212,9 @@ typedef struct RawPosixAIOData {
 static int cdrom_reopen(BlockDriverState *bs);
 #endif
 
-static int open_meta_file(BDRVRawState *s);
-static int open_data_file(BDRVRawState *s);
+static int open_meta_file(BDRVRawState *s, char *time_str);
+static int open_data_file(BDRVRawState *s, char *time_str);
+static int open_cdp_file(BDRVRawState *s);
 static void cdp_work_thread(void *data);
 
 #if defined(__NetBSD__)
@@ -626,11 +627,8 @@ static int raw_open_common(BlockDriverState *bs, QDict *options,
 
 
     //cdp
-    if( open_meta_file(s) ) {
+    if( open_cdp_file(s) ) {
         goto skip_cdp;    
-    }
-    if( open_data_file(s) ) {
-        goto skip_cdp;
     }
 
     qemu_mutex_init(&s->cdp_lock);
@@ -1709,15 +1707,13 @@ static int close_meta_file(BDRVRawState *s)
     return 0;
 }
 
-static int open_meta_file(BDRVRawState *s)
+static int open_meta_file(BDRVRawState *s, char *time_str)
 {
     int ret;
-    char time_str[100];
     char filename[100];
 
     close_meta_file(s);
 
-    gen_current_time_str(time_str);
     sprintf(filename, "%s/%s.%s", FILE_PATH, META_FILE_NAME, time_str);
     s->meta_file = fopen(filename, "wb");
     if( ! s->meta_file ) {
@@ -1739,15 +1735,13 @@ static int close_data_file(BDRVRawState *s)
 }
 
 /* 打开bio数据文件，文件命名格式：datafile.时间戳 */
-static int open_data_file(BDRVRawState *s)
+static int open_data_file(BDRVRawState *s, char *time_str)
 {
     int ret;
-    char time_str[100];
     char filename[100];
 
     close_data_file(s);
 
-    gen_current_time_str(time_str);
     sprintf(filename, "%s/%s.%s", FILE_PATH, DATA_FILE_NAME, time_str);
     s->data_file = fopen(filename, "wb");
     if( ! s->data_file ) {
@@ -1755,6 +1749,20 @@ static int open_data_file(BDRVRawState *s)
         return 1;
     }
     fprintf(stdout, "open_data_file %s", filename);
+    return 0;
+}
+
+/* 生成metafile和datafile */
+static int open_cdp_file(BDRVRawState *s)
+{
+    char time_str[100];
+    gen_current_time_str(time_str);
+    if( open_meta_file(s, time_str) ) {
+	return 1;
+    }
+    if( open_data_file(s, time_str) ) {
+	return 1;
+    }
     return 0;
 }
 
@@ -1799,8 +1807,7 @@ static int check_log_file(BDRVRawState *s, unsigned int data_size)
         fprintf(stdout, "check_log_file create_new");
         close_data_file(s);
         close_meta_file(s);
-        open_meta_file(s);
-        open_data_file(s);
+        open_cdp_file(s);
         return 0;
     }
     return ftell(s->data_file);
